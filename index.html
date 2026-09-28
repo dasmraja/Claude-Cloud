@@ -133,12 +133,17 @@
   #log { margin: 0; padding: 0; list-style: none; font-size: .85rem; color: var(--muted); max-height: 140px; overflow: auto; display: grid; gap: 4px; }
   #log li:first-child { color: var(--ink); }
 
-  dialog {
-    border: 0; border-radius: 16px; padding: 24px; width: min(92vw, 400px);
+  .modal {
+    position: fixed; inset: 0; z-index: 50;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.55); padding: 16px;
+  }
+  .modal[hidden] { display: none; }
+  .modal .box {
+    border-radius: 16px; padding: 24px; width: min(92vw, 400px);
     background: var(--panel); color: var(--ink); box-shadow: 0 20px 60px rgba(0,0,0,.5);
   }
-  dialog::backdrop { background: rgba(0,0,0,.55); }
-  dialog h2 { margin: 0 0 14px; }
+  .modal h2 { margin: 0 0 14px; }
   .setup-row { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
   .setup-row select, .setup-row input[type=text] {
     padding: 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink);
@@ -185,9 +190,9 @@
   </aside>
 </main>
 
-<dialog id="setup">
-  <form method="dialog" id="setupForm">
-    <h2>New game</h2>
+<div class="modal" id="setup" hidden>
+  <div class="box" role="dialog" aria-modal="true" aria-labelledby="setupTitle">
+    <h2 id="setupTitle">New game</h2>
     <div class="setup-row">
       <label for="count">Players</label>
       <select id="count">
@@ -199,17 +204,17 @@
       Roll the die and race to square 100. Ladders lift you up, snakes drag you down.
       You must land on 100 with an exact roll. Rolling a 6 gives you another turn.
     </p>
-    <div class="actions"><button type="submit" id="startBtn">Start</button></div>
-  </form>
-</dialog>
+    <div class="actions"><button type="button" id="startBtn">Start</button></div>
+  </div>
+</div>
 
-<dialog id="winDlg">
-  <form method="dialog">
+<div class="modal" id="winDlg" hidden>
+  <div class="box" role="dialog" aria-modal="true" aria-labelledby="winTitle">
     <h2 id="winTitle"></h2>
     <p id="winText"></p>
-    <div class="actions"><button id="againBtn" type="submit">Play again</button></div>
-  </form>
-</dialog>
+    <div class="actions"><button id="againBtn" type="button">Play again</button></div>
+  </div>
+</div>
 
 <script>
 (() => {
@@ -482,7 +487,7 @@
     log(`${p.name} reached 100 and wins!`);
     $('winTitle').textContent = `🏆 ${p.name} wins!`;
     $('winText').textContent = 'What a game. Ready for another round?';
-    $('winDlg').showModal();
+    $('winDlg').hidden = false;
   }
 
   // ---------- setup dialog ----------
@@ -506,10 +511,11 @@
     }
   }
 
-  function openSetup() { renderSetup(); $('setup').showModal(); }
+  function openSetup() { renderSetup(); $('winDlg').hidden = true; $('setup').hidden = false; }
 
   $('count').addEventListener('change', renderSetup);
-  $('setupForm').addEventListener('submit', () => {
+  $('startBtn').addEventListener('click', () => {
+    $('setup').hidden = true;
     const cfg = [...$('setupPlayers').querySelectorAll('.setup-row')].map((r, i) => ({
       name: r.querySelector('input').value.trim() || `Player ${i + 1}`,
       cpu: r.querySelector('select').value === 'cpu',
@@ -517,10 +523,10 @@
     startGame(cfg);
   });
   $('newBtn').addEventListener('click', openSetup);
-  $('winDlg').addEventListener('close', openSetup);
+  $('againBtn').addEventListener('click', openSetup);
   rollBtn.addEventListener('click', roll);
   document.addEventListener('keydown', (e) => {
-    if (e.code === 'Space' && !document.querySelector('dialog[open]') && !rollBtn.disabled
+    if (e.code === 'Space' && document.querySelectorAll('.modal:not([hidden])').length === 0 && !rollBtn.disabled
         && document.activeElement !== rollBtn) {
       e.preventDefault();
       roll();
