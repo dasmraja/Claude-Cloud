@@ -383,6 +383,8 @@
   const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
   const PEER_SRC = 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js';
   const PEER_PREFIX = 'snl-pages-';
+  const BEAT_MS = 5000;     // heartbeat interval
+  const STALE_MS = 25000;   // no message for this long = connection is dead
 
   const $ = (id) => document.getElementById(id);
   const board = $('board'), dieEl = $('die'), rollBtn = $('rollBtn');
@@ -762,7 +764,7 @@
     const p = players[turn];
     if (!p || !p.cpu || over || !isAuthority()) return;
     const s = session, pi = turn;
-    sleep(900).then(() => { if (s === session) enqueue(() => hostRoll(pi, s)); });
+    sleep(900).then(() => { if (s === session) enqueue(() => (players[pi] && players[pi].cpu ? hostRoll(pi, s) : null)); });
   }
 
   // Called by the roll button.
@@ -980,6 +982,7 @@
     mySlot: 0, started: false, bump: false,
     conns: new Set(),
     hostConn: null,
+    beat: null, hostSeen: 0,
 
     loadLib() {
       if (window.Peer) return Promise.resolve(window.Peer);
@@ -994,11 +997,41 @@
 
     reset() {
       const peer = this.peer;
+      this.stopBeat();
       this.role = null;   // so close events from destroy() are ignored
       this.peer = null;
       try { peer && peer.destroy(); } catch (e) { /* ignore */ }
       this.code = null; this.lobby = []; this.bump = false;
       this.started = false; this.conns = new Set(); this.hostConn = null; this.mySlot = 0;
+    },
+
+    // Heartbeat: browsers often do not report a dropped connection for a long time
+    // (or ever), so both sides ping and treat silence as a disconnect.
+    startBeat() {
+      this.stopBeat();
+      this.hostSeen = Date.now();
+      this.beat = setInterval(() => {
+        const now = Date.now();
+        if (this.role === 'host') {
+          this.broadcast({ t: 'ping' });
+          this.lobby.forEach((e) => {
+            if (e.conn && now - (e.conn._seen || 0) > STALE_MS) {
+              const c = e.conn;
+              try { c.close(); } catch (err) { /* ignore */ }
+              if (c._gone) c._gone();
+            }
+          });
+        } else if (this.role === 'guest') {
+          this.sendToHost({ t: 'ping' });
+          if (now - this.hostSeen > STALE_MS) this.onHostGone();
+        }
+      }, BEAT_MS);
+    },
+    stopBeat() { if (this.beat) clearInterval(this.beat); this.beat = null; },
+    touch() {   // forgive silence after this tab was in the background
+      const now = Date.now();
+      this.hostSeen = now;
+      this.lobby.forEach((e) => { if (e.conn) e.conn._seen = now; });
     },
 
     broadcast(msg) { this.conns.forEach((c) => { try { c.send(msg); } catch (e) { /* ignore */ } }); },
@@ -1029,21 +1062,31 @@
       this.peer.on('connection', (conn) => this.onGuestConnection(conn));
       this.peer.on('error', () => { /* per-connection errors are handled on the connection */ });
       this.peer.on('disconnected', () => { try { this.peer.reconnect(); } catch (e) { /* ignore */ } });
+      this.startBeat();
     },
 
     onGuestConnection(conn) {
       let slot = -1;
+      conn._seen = Date.now();
       conn.on('data', (m) => {
+        conn._seen = Date.now();
         if (!m || typeof m !== 'object') return;
         if (m.t === 'hello') {
           if (slot >= 0) return;
-          if (this.started) return conn.send({ t: 'reject', reason: 'That game has already started.' });
+          const wanted = cleanName(m.name).toLowerCase();
+          if (this.started) {
+            // A player who dropped out can take their seat back by using the same name.
+            const idx = wanted ? this.lobby.findIndex((e, i) => i > 0 && e.human && e.name.toLowerCase() === wanted) : -1;
+            if (idx < 0) return conn.send({ t: 'reject', reason: 'That game has already started. To rejoin, use the same name you played with.' });
+            slot = idx;
+            return this.reseat(idx, conn);
+          }
           if (this.lobby.length >= MAX_PLAYERS) return conn.send({ t: 'reject', reason: 'That room is full.' });
-          const entry = { name: uniqueName(cleanName(m.name) || `Player ${this.lobby.length + 1}`, this.lobby.map((e) => e.name)), cpu: false, conn };
+          const entry = { name: uniqueName(cleanName(m.name) || `Player ${this.lobby.length + 1}`, this.lobby.map((e) => e.name)), cpu: false, human: true, conn };
           this.lobby.push(entry);
           this.conns.add(conn);
           slot = this.lobby.indexOf(entry);
-          conn.send({ t: 'welcome', slot });
+          conn.send({ t: 'welcome', slot, name: entry.name });
           Sound.join();
           this.sendLobby();
         } else if (m.t === 'rollReq') {
@@ -1058,22 +1101,54 @@
         if (idx < 0) return;
         if (!this.started) {
           this.lobby.splice(idx, 1);
-          this.lobby.forEach((e, i) => { if (e.conn) e.conn.send({ t: 'welcome', slot: i }); });
+          this.lobby.forEach((e, i) => { if (e.conn) e.conn.send({ t: 'welcome', slot: i, name: e.name }); });
           this.sendLobby();
         } else {
           this.lobby[idx].conn = null;
           const p = players[idx];
-          if (p) {
+          if (p && !over) {
             p.cpu = true; p.local = false;
-            log(`${p.name} left. The computer takes over.`);
+            log(`${p.name} left. The computer takes over. They can rejoin with the same name.`);
             this.broadcast({ t: 'cpu', pi: idx });
             renderPlayers();
             if (turn === idx && !busy) { beginTurn(); }
           }
         }
       };
+      conn._gone = gone;
       conn.on('close', gone);
       conn.on('error', gone);
+    },
+
+    // Give a returning player their seat back (host side).
+    reseat(idx, conn) {
+      const e = this.lobby[idx];
+      const old = e.conn;
+      e.conn = conn;
+      if (old && old !== conn) { this.conns.delete(old); try { old.close(); } catch (err) { /* ignore */ } }
+      Sound.join();
+      if (over || !players.length) {
+        // between games: just sit in the waiting room until the host starts a rematch
+        this.conns.add(conn);
+        conn.send({ t: 'welcome', slot: idx, name: e.name });
+        this.sendLobby();
+        return;
+      }
+      enqueue(() => {
+        if (e.conn !== conn) return;
+        const p = players[idx];
+        if (!p) return;
+        p.cpu = false; p.local = false;
+        conn.send({
+          t: 'resume', you: idx, bump: this.bump, turn, turnCount,
+          players: players.map((q) => ({ name: q.name, cpu: q.cpu, pos: q.pos, stats: q.stats })),
+        });
+        this.broadcast({ t: 'back', pi: idx });
+        this.conns.add(conn);
+        log(`${p.name} is back in the game.`);
+        renderPlayers();
+        if (turn === idx && !busy) beginTurn();
+      });
     },
 
     sendLobby() {
@@ -1095,7 +1170,7 @@
         peer.on('open', () => {
           const conn = peer.connect(PEER_PREFIX + code, { reliable: true });
           this.hostConn = conn;
-          conn.on('open', () => { clearTimeout(timer); conn.send({ t: 'hello', name }); resolve(); });
+          conn.on('open', () => { clearTimeout(timer); conn.send({ t: 'hello', name }); this.startBeat(); store.set('snl.room', { code, name, t: Date.now() }); resolve(); });
           conn.on('data', (m) => this.onHostMessage(m));
           conn.on('close', () => this.onHostGone());
           conn.on('error', () => this.onHostGone());
@@ -1105,14 +1180,18 @@
 
     onHostMessage(m) {
       if (!m || typeof m !== 'object') return;
+      this.hostSeen = Date.now();
       switch (m.t) {
+        case 'ping': break;
         case 'reject':
           showLobbyError(String(m.reason || 'Could not join.'));
+          store.set('snl.room', null);
           leaveOnline(true);
           openSetup('online', String(m.reason || 'Could not join.'));
           break;
         case 'welcome':
           if (Number.isInteger(m.slot)) this.mySlot = m.slot;
+          if (m.name && this.code) store.set('snl.room', { code: this.code, name: cleanName(m.name), t: Date.now() });
           break;
         case 'lobby':
           if (Array.isArray(m.players)) {
@@ -1137,6 +1216,34 @@
             enqueue(() => (s === session ? playTurn(m.pi, m.v) : null));
           }
           break;
+        case 'resume': {
+          if (!Array.isArray(m.players) || !Number.isInteger(m.you) || !Number.isInteger(m.turn)) return;
+          const cfg = m.players.slice(0, MAX_PLAYERS).map((e, i) => ({
+            name: cleanName(e && e.name) || `Player ${i + 1}`, cpu: !!(e && e.cpu), local: i === m.you && !(e && e.cpu),
+          }));
+          if (cfg.length < 2 || m.you < 0 || m.you >= cfg.length || m.turn < 0 || m.turn >= cfg.length) return;
+          this.started = true;
+          this.mySlot = m.you;
+          startGame(cfg, 'guest', { bump: m.bump === true });
+          m.players.slice(0, cfg.length).forEach((e, i) => {
+            const q = players[i], st = (e && e.stats) || {};
+            q.pos = Number.isInteger(e && e.pos) && e.pos >= 0 && e.pos <= 100 ? e.pos : 0;
+            ['rolls', 'ladders', 'snakes', 'sixes', 'bumps', 'bumped'].forEach((k) => { if (Number.isInteger(st[k]) && st[k] >= 0) q.stats[k] = st[k]; });
+          });
+          turn = m.turn;
+          turnCount = Number.isInteger(m.turnCount) && m.turnCount >= 0 ? m.turnCount : 0;
+          placeTokens(false);
+          log('Reconnected. Welcome back!');
+          beginTurn();
+          break;
+        }
+        case 'back':
+          if (Number.isInteger(m.pi) && players[m.pi] && m.pi !== this.mySlot) {
+            players[m.pi].cpu = false; players[m.pi].local = false;
+            log(`${players[m.pi].name} is back in the game.`);
+            renderPlayers();
+          }
+          break;
         case 'cpu':
           if (Number.isInteger(m.pi) && players[m.pi]) {
             players[m.pi].cpu = true; players[m.pi].local = false;
@@ -1151,9 +1258,13 @@
     onHostGone() {
       if (this.role !== 'guest') return;
       const wasPlaying = this.started && !over;
+      const code = this.code;
       leaveOnline(true);
       $('lobby').hidden = true;
-      openSetup('online', wasPlaying ? 'The host left, so the game ended.' : 'Lost connection to the host.');
+      openSetup('online', wasPlaying
+        ? 'Lost connection to the game. Press Join to get back in. Your seat is kept for you.'
+        : 'Lost connection to the host.');
+      if (code) $('joinCode').value = code;
     },
   };
 
@@ -1169,6 +1280,7 @@
 
   function leaveOnline(keepUi) {
     const wasOnlineGame = mode !== 'local';
+    if (!keepUi) store.set('snl.room', null);
     Net.reset();
     if (!keepUi) $('lobby').hidden = true;
     if (wasOnlineGame) {
@@ -1272,6 +1384,8 @@
     renderSetup();
     $('bumpLocal').checked = !!store.get('snl.bump', false);
     $('myName').value = store.get('snl.myname', '');
+    const room = store.get('snl.room', null);
+    if (room && room.code && Date.now() - room.t < 12 * 3600 * 1000 && !$('joinCode').value) $('joinCode').value = room.code;
     setTab(tab || 'local');
     $('onlineError').textContent = errorMsg || '';
     $('closeSetup').hidden = !players.length;
@@ -1315,6 +1429,9 @@
   async function startJoining() {
     const name = cleanName($('myName').value);
     const code = $('joinCode').value.trim().toUpperCase();
+    const saved = store.get('snl.room', null);
+    // rejoining the same room: use the exact name the host gave us so the seat matches
+    const joinName = saved && saved.code === code && saved.name && Date.now() - saved.t < 12 * 3600 * 1000 ? saved.name : name;
     if (!name) { $('onlineError').textContent = 'Type your name first.'; $('myName').focus(); return; }
     if (code.length !== 5) { $('onlineError').textContent = 'Room codes have 5 letters or numbers.'; $('joinCode').focus(); return; }
     store.set('snl.myname', name);
@@ -1323,7 +1440,7 @@
     $('joinBtn').disabled = true;
     $('joinBtn').textContent = 'Joining…';
     try {
-      await Net.join(code, name);
+      await Net.join(code, joinName);
       Net.lobby = [];
       openLobby();
     } catch (err) {
@@ -1425,6 +1542,7 @@
     }
     if (e.key === 'Escape') { $('historyDlg').hidden = true; }
   });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) Net.touch(); });
   window.addEventListener('beforeunload', () => { try { Net.peer && Net.peer.destroy(); } catch (e) { /* ignore */ } });
 
   // test hook
