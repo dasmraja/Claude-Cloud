@@ -1296,10 +1296,16 @@
   }
 
   function onlineErrorText(err, joining) {
-    if (err && err.message === 'lib') return 'Could not load the online play library. Check your internet connection and try again.';
-    if (err && err.type === 'peer-unavailable') return 'No game found with that code. Check it and try again.';
-    if (err && err.message === 'timeout') return joining ? 'Could not reach that room. Check the code and try again.' : 'Could not reach the matchmaking server. Try again in a moment.';
-    return joining ? 'Could not join that room. Check the code and try again.' : 'Could not start a room. Try again in a moment.';
+    console.error('Online play error:', err);
+    const type = err && (err.type || err.message);
+    if (type === 'lib') return 'Could not load the online play library. Check your internet connection and try again.';
+    if (type === 'peer-unavailable') return 'No game found with that code. Check it and try again.';
+    if (['network', 'server-error', 'socket-error', 'socket-closed', 'timeout'].includes(type)) {
+      return 'Could not reach the online matchmaking server. Check your connection and try again. '
+        + 'Some previews and corporate networks block it, so open the game on its own page (not inside a preview). '
+        + `(${type})`;
+    }
+    return (joining ? 'Could not join that room.' : 'Could not start a room.') + ` Try again in a moment. (${type || 'unknown error'})`;
   }
 
   // ======================================================================
