@@ -200,6 +200,9 @@
   .linkrow { display: flex; gap: 8px; }
   .linkrow input { flex: 1; min-width: 0; padding: 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); font-size: .8rem; }
   .linkrow button { padding: 8px 12px; }
+  .check { display: flex; align-items: flex-start; gap: 10px; margin: 12px 0 4px; font-size: .9rem; line-height: 1.4; cursor: pointer; }
+  .check input { width: 18px; height: 18px; margin: 1px 0 0; flex: none; accent-color: var(--accent); }
+  .check small { display: block; color: var(--muted); }
   .divider { height: 1px; background: var(--line); margin: 16px 0; }
   .plist { list-style: none; margin: 10px 0; padding: 0; display: grid; gap: 6px; }
   .plist li { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; }
@@ -279,6 +282,10 @@
       </div>
       <div id="setupPlayers"></div>
       <p class="hint">Type each player's name. Pick Computer for any seat you want the game to play.</p>
+      <label class="check" for="bumpLocal">
+        <input type="checkbox" id="bumpLocal">
+        <span>Bump rule<small>Landing on a square sends any player already there back to start.</small></span>
+      </label>
       <div class="actions"><button type="button" id="startBtn">Start game</button></div>
     </section>
 
@@ -320,6 +327,10 @@
       </div>
     </div>
     <p class="hint" id="lobbyGuestMsg" hidden>Connected. Waiting for the host to start the game.</p>
+    <label class="check" for="bumpLobby" id="bumpLobbyRow">
+      <input type="checkbox" id="bumpLobby">
+      <span>Bump rule<small>Landing on a square sends any player already there back to start.</small></span>
+    </label>
     <ul class="plist" id="lobbyList" aria-label="Players in room"></ul>
     <p class="error" id="lobbyError" role="alert"></p>
     <div class="actions">
@@ -455,6 +466,7 @@
       ladder() { if (!ready()) return; [523, 659, 784, 1047, 1319].forEach((f, i) => tone(f, i * .09, .18, { type: 'triangle', gain: .25 })); },
       snake() { if (!ready()) return; tone(820, 0, 1, { type: 'sawtooth', to: 110, gain: .2, lowpass: 1400 }); noise(0, .9, .12, 700); },
       bump() { if (!ready()) return; tone(120, 0, .15, { type: 'square', gain: .15 }); tone(100, .18, .2, { type: 'square', gain: .15 }); },
+      bumped() { if (!ready()) return; tone(380, 0, .35, { type: 'square', to: 70, gain: .18, lowpass: 900 }); noise(0, .15, .25, 400); },
       bonus() { if (!ready()) return; tone(660, 0, .1, { gain: .22 }); tone(880, .1, .16, { gain: .22 }); },
       join() { if (!ready()) return; tone(600, 0, .09, { gain: .2 }); tone(800, .09, .12, { gain: .2 }); },
       win() {
@@ -642,7 +654,7 @@
   // The host rolls the dice for everyone; all clients then play the same
   // turn from the same (player, value) message, so they stay in sync.
   let players = [], turn = 0, busy = true, over = false, session = 0, turnCount = 0;
-  let mode = 'local', lastConfig = null;
+  let mode = 'local', lastConfig = null, bumpRule = false;
   let chain = Promise.resolve();
   const enqueue = (fn) => { chain = chain.then(fn).catch((e) => console.error(e)); return chain; };
 
@@ -700,8 +712,9 @@
     renderPlayers();
   }
 
-  function startGame(config, newMode) {
+  function startGame(config, newMode, opts) {
     session++;
+    bumpRule = !!(opts && opts.bump);
     chain = Promise.resolve();
     mode = newMode;
     lastConfig = config;
@@ -721,12 +734,13 @@
       t.appendChild(piece);
       board.appendChild(t);
       return { name: c.name, cpu: !!c.cpu, local: !!c.local, color: COLORS[i], pos: 0, el: t,
-        stats: { rolls: 0, ladders: 0, snakes: 0, sixes: 0 } };
+        stats: { rolls: 0, ladders: 0, snakes: 0, sixes: 0, bumps: 0, bumped: 0 } };
     });
     placeTokens(false);
     requestAnimationFrame(() => players.forEach((p) => (p.el.style.transition = '')));
     showDie(1);
     log(mode === 'local' ? 'Game started. Good luck!' : 'Online game started. Good luck!');
+    if (bumpRule) log('Bump rule is on: landing on a player sends them back to start.');
     beginTurn();
   }
 
@@ -823,6 +837,25 @@
         restart(p.el, 'drop', 520);
         flashCell(dest);
       }
+      if (bumpRule && p.pos > 0 && p.pos < 100) {
+        const victims = players.filter((q) => q !== p && q.pos === p.pos);
+        if (victims.length) {
+          const spot = p.pos, names = victims.map((q) => q.name).join(' and ');
+          victims.forEach((q) => { q.pos = 0; q.stats.bumped++; });
+          p.stats.bumps += victims.length;
+          say(`💥 ${p.name} bumped ${names} back to start!`);
+          log(`${p.name} bumped ${names} back to start`);
+          popup(spot, '💥 Bumped!');
+          flashCell(spot);
+          Sound.bumped();
+          await sleep(250);
+          if (s !== session) return;
+          placeTokens(true);
+          victims.forEach((q) => restart(q.el, 'drop', 520));
+          renderPlayers();
+          if (!await alive(900)) return;
+        }
+      }
       if (p.pos === 100) { finishGame(p); return; }
     }
 
@@ -856,7 +889,7 @@
     ul.innerHTML = '';
     players.forEach((q) => {
       const li = document.createElement('li');
-      li.textContent = `${q.name}: ${q.stats.rolls} rolls, ${q.stats.ladders} ladders, ${q.stats.snakes} snakes, ${q.stats.sixes} sixes`;
+      li.textContent = `${q.name}: ${q.stats.rolls} rolls, ${q.stats.ladders} ladders, ${q.stats.snakes} snakes, ${q.stats.sixes} sixes${bumpRule ? `, bumped ${q.stats.bumps}` : ''}`;
       ul.appendChild(li);
     });
     const canRematch = mode !== 'guest';
@@ -944,7 +977,7 @@
   const Net = {
     peer: null, code: null, role: null,
     lobby: [],          // host: [{name, cpu, conn}], guest: [{name, cpu}]
-    mySlot: 0, started: false,
+    mySlot: 0, started: false, bump: false,
     conns: new Set(),
     hostConn: null,
 
@@ -964,7 +997,7 @@
       this.role = null;   // so close events from destroy() are ignored
       this.peer = null;
       try { peer && peer.destroy(); } catch (e) { /* ignore */ }
-      this.code = null; this.lobby = [];
+      this.code = null; this.lobby = []; this.bump = false;
       this.started = false; this.conns = new Set(); this.hostConn = null; this.mySlot = 0;
     },
 
@@ -976,6 +1009,7 @@
       this.reset();
       this.role = 'host';
       this.lobby = [{ name, cpu: false, conn: null }];
+      this.bump = !!store.get('snl.bump', false);
       for (let attempt = 0; attempt < 4; attempt++) {
         const code = Array.from({ length: 5 }, () => CODE_CHARS[rand(CODE_CHARS.length)]).join('');
         try {
@@ -1044,7 +1078,7 @@
 
     sendLobby() {
       const players = this.lobby.map((e) => ({ name: e.name, cpu: e.cpu }));
-      this.broadcast({ t: 'lobby', players });
+      this.broadcast({ t: 'lobby', players, bump: this.bump });
       renderLobby();
     },
 
@@ -1083,6 +1117,7 @@
         case 'lobby':
           if (Array.isArray(m.players)) {
             this.lobby = m.players.slice(0, MAX_PLAYERS).map((e) => ({ name: cleanName(e && e.name) || 'Player', cpu: !!(e && e.cpu) }));
+            this.bump = m.bump === true;
             renderLobby();
           }
           break;
@@ -1093,7 +1128,7 @@
           }));
           if (cfg.length < 2) return;
           this.started = true;
-          startGame(cfg, 'guest');
+          startGame(cfg, 'guest', { bump: m.bump === true });
           break;
         }
         case 'roll':
@@ -1168,6 +1203,8 @@
     $('lobbyHost').hidden = !host;
     $('lobbyGuestMsg').hidden = host;
     $('addCpuBtn').hidden = !host;
+    $('bumpLobby').checked = !!Net.bump;
+    $('bumpLobby').disabled = !host;
     $('lobbyStartBtn').hidden = !host;
     $('lobbyStartBtn').disabled = Net.lobby.length < 2;
     $('addCpuBtn').disabled = Net.lobby.length >= MAX_PLAYERS;
@@ -1190,8 +1227,8 @@
     Net.started = true;
     Net.lobby.forEach((e, i) => { if (i > 0 && !e.cpu && !e.conn) e.cpu = true; });
     const defs = Net.lobby.map((e) => ({ name: e.name, cpu: e.cpu }));
-    Net.lobby.forEach((e, i) => { if (e.conn) { try { e.conn.send({ t: 'start', players: defs, you: i }); } catch (err) { /* ignore */ } } });
-    startGame(defs.map((d, i) => ({ ...d, local: i === 0 })), 'host');
+    Net.lobby.forEach((e, i) => { if (e.conn) { try { e.conn.send({ t: 'start', players: defs, you: i, bump: Net.bump }); } catch (err) { /* ignore */ } } });
+    startGame(defs.map((d, i) => ({ ...d, local: i === 0 })), 'host', { bump: Net.bump });
   }
 
   // ======================================================================
@@ -1233,6 +1270,7 @@
   function openSetup(tab, errorMsg) {
     closeAll();
     renderSetup();
+    $('bumpLocal').checked = !!store.get('snl.bump', false);
     $('myName').value = store.get('snl.myname', '');
     setTab(tab || 'local');
     $('onlineError').textContent = errorMsg || '';
@@ -1251,9 +1289,10 @@
       taken.push(name);
       return { name, cpu, local: !cpu };
     });
+    store.set('snl.bump', $('bumpLocal').checked);
     leaveOnline();
     Sound.unlock();
-    startGame(cfg, 'local');
+    startGame(cfg, 'local', { bump: $('bumpLocal').checked });
   }
 
   async function startHosting() {
@@ -1330,6 +1369,12 @@
     Net.sendLobby();
   });
   $('lobbyStartBtn').addEventListener('click', hostStartGame);
+  $('bumpLobby').addEventListener('change', (e) => {
+    if (Net.role !== 'host') return;
+    Net.bump = e.target.checked;
+    store.set('snl.bump', Net.bump);
+    Net.sendLobby();
+  });
   $('copyBtn').addEventListener('click', async () => {
     const input = $('lobbyLink');
     try { await navigator.clipboard.writeText(input.value); $('copyBtn').textContent = 'Copied!'; }
@@ -1354,7 +1399,7 @@
 
   $('againBtn').addEventListener('click', () => {
     if (mode === 'host') hostStartGame();
-    else if (lastConfig) startGame(lastConfig.map((c) => ({ ...c })), 'local');
+    else if (lastConfig) startGame(lastConfig.map((c) => ({ ...c })), 'local', { bump: bumpRule });
   });
   $('menuBtn').addEventListener('click', () => {
     $('winDlg').hidden = true;

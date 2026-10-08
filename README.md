@@ -8,6 +8,7 @@ A single-file browser game of Snakes & Ladders. Open `index.html` in any modern 
 - Animated dice, hopping tokens, ladder/snake highlights and a win celebration
 - Score history (leaderboard and recent games), stored in the browser
 - Classic 10×10 board with 9 ladders and 10 snakes; exact roll needed to land on 100; a 6 gives another turn
+- Optional **Bump rule** (off by default): landing on a square sends any player already there back to start. In online games the host chooses.
 - Press **Space** (or click the button) to roll
 
 ## Online play
